@@ -1,299 +1,231 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <errno.h>
 #include <ncurses.h>
 #include "buffer.h"
 #include "utils.h"
 #include "history.h"
+#include "syntax.h"
 
 #define CTRL(c) ((c) & 037)
-#define LINE_NUMBER_WIDTH 4
 
-size_t get_buffer_position(size_t x_pos, size_t y_pos, size_t width, size_t first_character) {
-    size_t screen_index = (x_pos - 1) + y_pos * (width - 2);
-    return screen_index + first_character;
-}
-
-void display_status_message(const char* message) {
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    
-    int cur_y, cur_x;
-    getyx(stdscr, cur_y, cur_x);
-    
-    move(rows - 1, 0);
-    clrtoeol();
-    
-    attron(A_REVERSE);
-    mvprintw(rows - 1, 0, "%s", message);
-    attroff(A_REVERSE);
-    
-    for (int i = strlen(message); i < cols; i++) {
-        addch(' ');
+static void search_text(Editor* editor, int backwards, int include_current) {
+    if (!editor->search[0]) {
+        snprintf(editor->message, sizeof(editor->message), "Use Ctrl+F to enter search text");
+        return;
     }
-    
-    move(cur_y, cur_x);
-    refresh();
+    size_t start = editor->cursor_pos;
+    if (!include_current) {
+        if (backwards) start = start ? start - 1 : editor->buf->text_size;
+        else start++;
+    }
+    size_t found = find_text(editor->buf, editor->search, start, backwards);
+    if (found == SIZE_MAX) {
+        snprintf(editor->message, sizeof(editor->message), "No matches for: %s", editor->search);
+    } else {
+        editor->cursor_pos = found;
+        snprintf(editor->message, sizeof(editor->message), "Found: %s | Ctrl+N next, Ctrl+P previous, Esc clear", editor->search);
+    }
 }
 
-int main(int argc __attribute__((unused)), char** argv) {
-    char filename[256] = {0};
-    
-    if (!argv[1]) {
-        char ch;
-        printf("No file Specified, would you like to create a file? Y/N: ");
-        scanf("%c", &ch);
-        if (ch == 'Y' || ch == 'y') {
-            printf("Enter a file name: ");
-            scanf("%255s", filename);
-            create_new_file(filename);
-        } else {
-            printf("No file specified. Exiting.\n");
+static void go_to_line(Editor* editor) {
+    char input[INPUT_SIZE] = {0};
+    if (!prompt_input(editor, "Go to line: ", input, sizeof(input))) return;
+    char* end;
+    errno = 0;
+    unsigned long long line = strtoull(input, &end, 10);
+    if (input[0] < '0' || input[0] > '9' || *end || errno || !line || line > SIZE_MAX) {
+        snprintf(editor->message, sizeof(editor->message), "Enter a positive line number");
+        return;
+    }
+    size_t position = line_position(editor->buf, (size_t)line);
+    size_t actual_line = 1;
+    for (size_t i = 0; i < position; i++) {
+        if (buffer_character(editor->buf, i) == '\n') actual_line++;
+    }
+    if (actual_line != line) {
+        snprintf(editor->message, sizeof(editor->message), "Line does not exist");
+        return;
+    }
+    editor->cursor_pos = position;
+}
+
+static void replace_text(Editor* editor) {
+    char text[INPUT_SIZE];
+    char replacement[INPUT_SIZE] = {0};
+    snprintf(text, sizeof(text), "%s", editor->search);
+    if (!prompt_input(editor, "Replace text: ", text, sizeof(text)) || !text[0]) return;
+    if (!prompt_input(editor, "Replace with (empty deletes): ", replacement, sizeof(replacement))) return;
+    size_t count;
+    if (!replace_all(editor, text, replacement, &count)) {
+        snprintf(editor->message, sizeof(editor->message), "Replace failed: not enough memory");
+        return;
+    }
+    snprintf(editor->search, sizeof(editor->search), "%s", text);
+    snprintf(editor->message, sizeof(editor->message), "%zu matches replaced | Ctrl+Z to undo", count);
+}
+
+int main(int argc, char** argv) {
+    char filename[4096] = {0};
+    if (argc > 2) {
+        fprintf(stderr, "Usage: %s [filename]\n", argv[0]);
+        return 1;
+    }
+    if (argc == 2) {
+        if (strlen(argv[1]) >= sizeof(filename)) {
+            fprintf(stderr, "Filename is too long\n");
             return 1;
         }
+        strcpy(filename, argv[1]);
     } else {
-        strncpy(filename, argv[1], sizeof(filename) - 1);
-        filename[sizeof(filename) - 1] = '\0';
+        printf("Enter a file name: ");
+        if (!fgets(filename, sizeof(filename), stdin)) return 1;
+        filename[strcspn(filename, "\r\n")] = '\0';
+        if (!filename[0]) return 1;
     }
-    
     Buffer* buf = create_buffer();
-    
-    History* history = create_history(100);
-    
-    initscr();
-    raw();
-    noecho();        
-    keypad(stdscr, TRUE);  
-    refresh();
-    
-    size_t width, height;
-    size_t X_POS = 1 + LINE_NUMBER_WIDTH, Y_POS = 0;
-    getmaxyx(stdscr, height, width);
-    load_file_into_buffer(filename, buf, width);
-    int ch;  
-    cursor initial_coordinates = initial_buffer_render_on_window(buf, width, height);
-
-    if (initial_coordinates.status == 0) {
-        X_POS = initial_coordinates.initial_x_pos + LINE_NUMBER_WIDTH;
-        Y_POS = initial_coordinates.initial_y_pos;
+    History* history = create_history(1000);
+    if (!buf || !history || !load_file_into_buffer(filename, buf)) {
+        fprintf(stderr, "Unable to open %s or allocate editor memory\n", filename);
+        free_history(history);
+        free_buffer(buf);
+        return 1;
     }
-    
-    display_status_bar(buf, filename, X_POS, Y_POS);
-    
-    while ((ch = getch()) != CTRL_Q) {
-        size_t pre_x = X_POS;
-        size_t pre_y = Y_POS;
-        size_t buffer_pos = get_buffer_position(X_POS - LINE_NUMBER_WIDTH, Y_POS, width, buf->first_character);
-        
-        if (ch == CTRL('z')) {
-            if (undo(history, buf, &X_POS, &Y_POS, width)) {
-                redraw_window(buf, width);
-                move(Y_POS, X_POS);
-            }
-            display_status_bar(buf, filename, X_POS, Y_POS);
-            continue;
-        } else if (ch == CTRL('y')) {
-            if (redo(history, buf, &X_POS, &Y_POS, width)) {
-                redraw_window(buf, width);
-                move(Y_POS, X_POS);
-            }
-            display_status_bar(buf, filename, X_POS, Y_POS);
-            continue;
-        } else if (ch == CTRL('s')) {
-            save_contents_to_file(filename, buf, width);
-            display_status_message("File saved");
-            display_status_bar(buf, filename, X_POS, Y_POS);
-            move(Y_POS, X_POS);
-            continue;
-        }
-        
+    Editor editor = {0};
+    editor.buf = buf;
+    editor.history = history;
+    editor.filename = filename;
+    editor.auto_indent = 1;
+
+    initscr();
+    initialize_syntax_colors(editor.light_theme);
+    raw();
+    noecho();
+    keypad(stdscr, TRUE);
+    int running = 1;
+    int quit_pending = 0;
+    while (running) {
+        redraw_window(&editor);
+        int ch = getch();
+        if (ch == KEY_RESIZE) continue;
+        editor.message[0] = '\0';
+        if (ch != CTRL('q')) quit_pending = 0;
+        int success = 1;
         switch (ch) {
+            case CTRL('q'):
+                if (history->revision != history->saved_revision && !quit_pending) {
+                    snprintf(editor.message, sizeof(editor.message), "Unsaved changes: Ctrl+S to save, Ctrl+Q again to discard");
+                    quit_pending = 1;
+                } else running = 0;
+                break;
+            case CTRL('s'):
+                if (save_contents_to_file(filename, buf)) {
+                    history->saved_revision = history->revision;
+                    snprintf(editor.message, sizeof(editor.message), "File saved");
+                } else snprintf(editor.message, sizeof(editor.message), "Save failed: %s", strerror(errno));
+                break;
+            case CTRL('z'):
+                if (!undo(history, buf, &editor.cursor_pos)) snprintf(editor.message, sizeof(editor.message), "Nothing to undo");
+                break;
+            case CTRL('y'):
+                if (!redo(history, buf, &editor.cursor_pos)) snprintf(editor.message, sizeof(editor.message), "Nothing to redo");
+                break;
+            case CTRL('f'): {
+                char text[INPUT_SIZE];
+                snprintf(text, sizeof(text), "%s", editor.search);
+                if (prompt_input(&editor, "Find: ", text, sizeof(text))) {
+                    snprintf(editor.search, sizeof(editor.search), "%s", text);
+                    search_text(&editor, 0, 1);
+                }
+                break;
+            }
+            case CTRL('n'):
+                search_text(&editor, 0, 0);
+                break;
+            case CTRL('p'):
+                search_text(&editor, 1, 0);
+                break;
+            case CTRL('r'):
+                replace_text(&editor);
+                break;
+            case CTRL('g'):
+                go_to_line(&editor);
+                break;
+            case 27:
+                editor.search[0] = '\0';
+                break;
+            case KEY_F(1):
+                display_help(&editor);
+                break;
+            case KEY_F(2):
+                editor.auto_indent = !editor.auto_indent;
+                break;
+            case KEY_F(3):
+                editor.syntax_mode = (editor.syntax_mode + 1) % 6;
+                snprintf(editor.message, sizeof(editor.message), "Syntax: %s",
+                         editor.syntax_mode ? language_name((Language)(editor.syntax_mode - 1)) : "Auto");
+                break;
+            case KEY_F(4):
+                editor.light_theme = !editor.light_theme;
+                initialize_syntax_colors(editor.light_theme);
+                snprintf(editor.message, sizeof(editor.message), "Syntax palette: %s", editor.light_theme ? "light" : "dark");
+                break;
+            case KEY_HOME:
+            case CTRL('a'):
+                editor.cursor_pos = line_start(buf, editor.cursor_pos);
+                break;
+            case KEY_END:
+            case CTRL('e'):
+                editor.cursor_pos = line_end(buf, editor.cursor_pos);
+                break;
+            case KEY_UP:
+                move_vertical(&editor, -1, 1);
+                break;
+            case KEY_DOWN:
+                move_vertical(&editor, 1, 1);
+                break;
+            case KEY_PPAGE:
+            case KEY_NPAGE:
+                move_vertical(&editor, ch == KEY_PPAGE ? -1 : 1, LINES > 2 ? (size_t)(LINES - 2) : 1);
+                break;
+            case KEY_LEFT:
+                if (editor.cursor_pos) editor.cursor_pos--;
+                break;
+            case KEY_RIGHT:
+                if (editor.cursor_pos < buf->text_size) editor.cursor_pos++;
+                break;
             case KEY_BACKSPACE:
-                if (X_POS > 1 + LINE_NUMBER_WIDTH) {
-                    size_t del_pos = (X_POS - 2 - LINE_NUMBER_WIDTH) + Y_POS * (width - 2) + buf->first_character;
-                    char del_char = ' ';
-                    
-                    if (del_pos < buf->text_size) {
-                        if (del_pos < buf->gap_start) {
-                            del_char = buf->buffer[del_pos];
-                        } else {
-                            del_char = buf->buffer[buf->gap_end + (del_pos - buf->gap_start)];
-                        }
-                    }
-                    
-                    X_POS--;
-                    record_delete(history, del_pos, del_char, pre_x, pre_y);
-                    render_backspace_on_window(buf, X_POS - LINE_NUMBER_WIDTH, Y_POS, width);
-                    display_status_bar(buf, filename, X_POS, Y_POS);
-                } else if (X_POS == 1 + LINE_NUMBER_WIDTH && Y_POS > 0) {
-                    size_t prev_line_end = ((Y_POS - 1) * (width - 2) + (width - 2) - 1) + buf->first_character;
-                    char del_char = ' ';
-                    
-                    if (prev_line_end < buf->text_size) {
-                        if (prev_line_end < buf->gap_start) {
-                            del_char = buf->buffer[prev_line_end];
-                        } else {
-                            del_char = buf->buffer[buf->gap_end + (prev_line_end - buf->gap_start)];
-                        }
-                    }
-                    
-                    X_POS = width - 1;
-                    Y_POS--;
-                    record_delete(history, prev_line_end, del_char, pre_x, pre_y);
-                    move(Y_POS, X_POS);
-                    display_status_bar(buf, filename, X_POS, Y_POS);
+            case 127:
+            case 8:
+                if (editor.cursor_pos) {
+                    success = record_edit(history, buf, editor.cursor_pos - 1, 1, "", 0,
+                                          &editor.cursor_pos, editor.cursor_pos - 1);
                 }
                 break;
             case KEY_DC:
-                if (X_POS > 1 + LINE_NUMBER_WIDTH) {
-                    size_t del_pos = (X_POS - 2 - LINE_NUMBER_WIDTH) + Y_POS * (width - 2) + buf->first_character;
-                    char del_char = ' ';
-                    
-                    if (del_pos < buf->text_size) {
-                        if (del_pos < buf->gap_start) {
-                            del_char = buf->buffer[del_pos];
-                        } else {
-                            del_char = buf->buffer[buf->gap_end + (del_pos - buf->gap_start)];
-                        }
-                    }
-                    
-                    X_POS--;
-                    record_delete(history, del_pos, del_char, pre_x, pre_y);
-                    render_backspace_on_window(buf, X_POS - LINE_NUMBER_WIDTH, Y_POS, width);
-                    display_status_bar(buf, filename, X_POS, Y_POS);
-                } else if (X_POS == 1 + LINE_NUMBER_WIDTH && Y_POS > 0) {
-                    X_POS = width - 1;
-                    Y_POS--;
-                    move(Y_POS, X_POS);
-                    display_status_bar(buf, filename, X_POS, Y_POS);
+                if (editor.cursor_pos < buf->text_size) {
+                    success = record_edit(history, buf, editor.cursor_pos, 1, "", 0,
+                                          &editor.cursor_pos, editor.cursor_pos);
                 }
                 break;
-            case KEY_UP:
-                if (Y_POS == 0 && buf->first_character > 0) {
-                    buf->first_character -= (width - 2);
-                    buf->last_character -= (width - 2);
-                    redraw_window(buf, width);
-                    
-                    move(Y_POS, X_POS);
-                }
-                if (Y_POS > 0) {
-                    Y_POS--;
-                    move(Y_POS, X_POS);
-                }
-                display_status_bar(buf, filename, X_POS, Y_POS);
-                break;
-            case KEY_DOWN:
-                if (Y_POS >= height - 1) {
-                    size_t max_first = buf->text_size > (width - 2) ? buf->text_size - (width - 2) : 0;
-                    
-                    if (buf->first_character < max_first) {
-                        buf->first_character += (width - 2);
-                        buf->last_character += (width - 2);
-                        
-                        if (buf->first_character > max_first) {
-                            buf->first_character = max_first;
-                        }
-                        
-                        size_t buffer_index = (X_POS - 1) + Y_POS * (width - 2) + buf->first_character;
-                        
-                        if (buffer_index > buf->text_size) {
-                            move_buffer_cursor(buf, buf->text_size);
-                            
-                            while (buf->text_size < buffer_index) {
-                                if ((buf->text_size % (width - 2)) == 0 && buf->text_size > 0) {
-                                    insert_buffer(buf, '\n');
-                                } else {
-                                    insert_buffer(buf, ' ');
-                                }
-                            }
-                        }
-                        
-                        move_buffer_cursor(buf, buffer_index);
-                        redraw_window(buf, width);
-                        
-                        move(Y_POS, X_POS);
-                    }
-                } else {
-                    Y_POS++;
-                    move(Y_POS, X_POS);
-                }
-                display_status_bar(buf, filename, X_POS, Y_POS);
-                break;
-            case KEY_LEFT:
-                if (X_POS > 1 + LINE_NUMBER_WIDTH) {
-                    X_POS--;
-                    move(Y_POS, X_POS);
-                } else if (X_POS == 1 + LINE_NUMBER_WIDTH && Y_POS > 0) {
-                    X_POS = width - 1;
-                    Y_POS--;
-                    
-                    if (Y_POS == 0 && buf->first_character > 0) {
-                        buf->first_character -= (width - 2);
-                        buf->last_character -= (width - 2);
-                        redraw_window(buf, width);
-                        Y_POS = 0;
-                    }
-                    
-                    move(Y_POS, X_POS);
-                }
-                display_status_bar(buf, filename, X_POS, Y_POS);
-                break;
-            case KEY_RIGHT:
-                if (X_POS < width - 1) {
-                    X_POS++;
-                    move(Y_POS, X_POS);
-                } else if (X_POS == width - 1) {
-                    X_POS = 1;
-                    Y_POS++;
-                    
-                    if (Y_POS >= height - 1) {
-                        size_t max_first = buf->text_size > (width - 2) ? buf->text_size - (width - 2) : 0;
-                        
-                        if (buf->first_character < max_first) {
-                            buf->first_character += (width - 2);
-                            buf->last_character += (width - 2);
-                            
-                            if (buf->first_character > max_first) {
-                                buf->first_character = max_first;
-                            }
-                            
-                            redraw_window(buf, width);
-                            Y_POS = height - 2;
-                        }
-                    }
-                    
-                    move(Y_POS, X_POS);
-                }
-                display_status_bar(buf, filename, X_POS, Y_POS);
-                break;
-            case ' ':
-                record_insert(history, buffer_pos, ' ', pre_x, pre_y);
-                render_space_on_window(buf, &X_POS, &Y_POS, width);
-                display_status_bar(buf, filename, X_POS, Y_POS);
-                break;
-            case 0x0A:
-                start_batch(history);
-                
-                record_enter(history, buffer_pos, pre_x, pre_y);
-                
-                render_enter_on_window(buf, &X_POS, &Y_POS, width);
-                
-                end_batch(history);
-                display_status_bar(buf, filename, X_POS, Y_POS);
+            case '\n':
+            case '\r':
+            case KEY_ENTER:
+                success = insert_newline(&editor);
                 break;
             default:
-                if (ch >= 32 && ch <= 126) {
-                    record_insert(history, buffer_pos, ch, pre_x, pre_y);
+                if ((ch >= 32 && ch <= 126) || ch == '\t') {
+                    char character = (char)ch;
+                    success = record_edit(history, buf, editor.cursor_pos, 0, &character, 1,
+                                          &editor.cursor_pos, editor.cursor_pos + 1);
                 }
-                update_general_window(buf, &X_POS, &Y_POS, ch, width);
-                display_status_bar(buf, filename, X_POS, Y_POS);
+                break;
         }
-        
-        refresh();
+        if (!success) snprintf(editor.message, sizeof(editor.message), "Edit failed: not enough memory");
     }
-    save_contents_to_file(filename, buf, width);
     endwin();
-    
     free_history(history);
     free_buffer(buf);
     return 0;

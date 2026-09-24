@@ -1,10 +1,9 @@
+#pragma once
+
 #include <stdio.h>
 #include <stdlib.h>
 
-#pragma once
-
-#define INITIAL_BUFFER_SIZE 1024  
-#define GAP_SIZE 5
+#define INITIAL_BUFFER_SIZE 1024
 
 typedef struct {
     char* buffer;
@@ -12,18 +11,15 @@ typedef struct {
     size_t gap_start;
     size_t gap_end;
     size_t text_size;
-    size_t last_character;
-    size_t first_character;
-
-} Buffer; 
+} Buffer;
 
 Buffer* create_buffer(void);
-void insert_buffer(Buffer* buf, char ch);
+int insert_buffer(Buffer* buf, char ch);
 void delete_buffer(Buffer* buf);
 void move_buffer_cursor(Buffer* buf, size_t position);
-void resize_buffer(Buffer* buf, size_t new_size);
+int resize_buffer(Buffer* buf, size_t new_size);
 void free_buffer(Buffer* buf);
-void create_new_file(char filename[]);
-void load_file_into_buffer(char filename[], Buffer* buf, size_t screen_width);
-void trim(char filename[]);
-void save_contents_to_file(char filename[], Buffer* buf, size_t screen_width);
+char buffer_character(const Buffer* buf, size_t position);
+int replace_buffer(Buffer* buf, size_t position, size_t length, const char* text, size_t text_size);
+int load_file_into_buffer(const char* filename, Buffer* buf);
+int save_contents_to_file(const char* filename, const Buffer* buf);

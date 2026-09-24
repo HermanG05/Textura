@@ -1,37 +1,34 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <ncurses.h>
+#pragma once
+
 #include "buffer.h"
+#include "history.h"
 
-#define LINE_NUMBER_WIDTH 4
-
-typedef enum {
-    BACKSPACE = 0x7F,
-    ENTER = 0x0A,
-    ESC = 0x1B,
-    ARROW_UP = 0x41,
-    ARROW_DOWN = 0x42,
-    ARROW_LEFT = 0x44,
-    ARROW_RIGHT = 0x43,
-    CTRL_C = 0x03,
-    CTRL_S = 0x13,
-    CTRL_Q = 0x11,
-    DEL_KEY = 0x7E,
-} keyPress;
+#define LINE_NUMBER_WIDTH 6
+#define TAB_WIDTH 4
+#define INPUT_SIZE 256
 
 typedef struct {
-    size_t initial_x_pos;
-    size_t initial_y_pos;
-    int status;
-} cursor;
+    Buffer* buf;
+    History* history;
+    size_t cursor_pos;
+    size_t top_line;
+    size_t left_column;
+    char search[INPUT_SIZE];
+    char message[512];
+    const char* filename;
+    int auto_indent;
+    int syntax_mode;
+    int light_theme;
+} Editor;
 
-void display_line_number(size_t line_number, size_t y_pos);
-cursor initial_buffer_render_on_window(Buffer* buf, size_t width, size_t height);
-void redraw_window(Buffer* buf, size_t width);
-void render_backspace_on_window(Buffer* buf, size_t x_pos, size_t y_pos, size_t width);
-void render_delete_on_window(Buffer* buf, size_t x_pos, size_t y_pos, size_t width);
-void render_space_on_window(Buffer* buf, size_t *x_pos, size_t *y_pos, size_t width);
-void render_enter_on_window(Buffer* buf, size_t *x_pos, size_t *y_pos, size_t width);
-void update_general_window(Buffer* buf, size_t* x_pos, size_t* y_pos, int ch, size_t width);
-void display_status_bar(Buffer* buf, const char* filename, size_t x_pos, size_t y_pos);
-
+size_t line_start(const Buffer* buf, size_t position);
+size_t line_end(const Buffer* buf, size_t position);
+size_t line_position(const Buffer* buf, size_t line);
+size_t find_text(const Buffer* buf, const char* text, size_t start, int backwards);
+int matches_text(const Buffer* buf, const char* text, size_t position);
+int replace_all(Editor* editor, const char* text, const char* replacement, size_t* count);
+int insert_newline(Editor* editor);
+void move_vertical(Editor* editor, int direction, size_t count);
+void redraw_window(Editor* editor);
+int prompt_input(Editor* editor, const char* label, char* input, size_t capacity);
+void display_help(Editor* editor);

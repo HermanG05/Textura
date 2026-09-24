@@ -1,469 +1,287 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <ncurses.h>
 #include "utils.h"
-#include "buffer.h"
+#include "syntax.h"
 
-#define LINE_NUMBER_WIDTH 4
-
-void display_line_number(size_t line_number, size_t y_pos) {
-    char line_num_str[10];
-    sprintf(line_num_str, "%3zu", line_number + 1);
-    
-    attron(A_DIM);
-    mvprintw(y_pos, 0, "%s", line_num_str);
-    attroff(A_DIM);
+size_t line_start(const Buffer* buf, size_t position) {
+    while (position > 0 && buffer_character(buf, position - 1) != '\n') position--;
+    return position;
 }
 
-cursor initial_buffer_render_on_window(Buffer* buf, size_t width, size_t height) {
-    cursor coordinates;
+size_t line_end(const Buffer* buf, size_t position) {
+    while (position < buf->text_size && buffer_character(buf, position) != '\n') position++;
+    return position;
+}
 
-    if (!buf) {
-        coordinates.status = -1;
-        return coordinates;
-    }    
-
-    size_t Y_POS = 0;
-    size_t X_POS = 1;
-    size_t end_of_screen = height * (width - 2);
-
-    buf->first_character = 0;
-    buf->last_character = 0;
-
-    clear();
-
-    display_line_number(Y_POS, Y_POS);
-
-    for (size_t index = 0; index < buf->gap_start; index++) {
-        if ((X_POS - 1) + Y_POS * (width - 2) >= end_of_screen) {
-            buf->last_character = index;
-            break;
-        }
-
-        if (X_POS >= width - 1) {
-            X_POS = 1;
-            Y_POS++;
-            
-            display_line_number(Y_POS, Y_POS);
-            
-            if (Y_POS >= height) {
-                buf->last_character = index;
-                break;
-            }
-        }
-        
-        mvaddch(Y_POS, X_POS + LINE_NUMBER_WIDTH, buf->buffer[index]);
-        X_POS++;
+size_t line_position(const Buffer* buf, size_t line) {
+    size_t position = 0;
+    while (line > 1 && position < buf->text_size) {
+        if (buffer_character(buf, position++) == '\n') line--;
     }
+    return position;
+}
 
-    if (Y_POS < height) {
-        for (size_t i = 0; i < (buf->text_size - buf->gap_start); i++) {
-            size_t index = buf->gap_end + i;
-            
-            if (index >= buf->buffer_size || 
-                (X_POS - 1) + Y_POS * (width - 2) >= end_of_screen) {
-                break;
+int matches_text(const Buffer* buf, const char* text, size_t position) {
+    size_t length = strlen(text);
+    if (!length || position > buf->text_size || length > buf->text_size - position) return 0;
+    for (size_t i = 0; i < length; i++) {
+        if (buffer_character(buf, position + i) != text[i]) return 0;
+    }
+    return 1;
+}
+
+size_t find_text(const Buffer* buf, const char* text, size_t start, int backwards) {
+    if (!text[0] || !buf->text_size) return SIZE_MAX;
+    if (start >= buf->text_size) start = backwards ? buf->text_size - 1 : 0;
+    size_t position = start;
+    do {
+        if (matches_text(buf, text, position)) return position;
+        if (backwards) position = position ? position - 1 : buf->text_size - 1;
+        else position = position + 1 == buf->text_size ? 0 : position + 1;
+    } while (position != start);
+    return SIZE_MAX;
+}
+
+int replace_all(Editor* editor, const char* text, const char* replacement, size_t* count) {
+    Buffer* buf = editor->buf;
+    size_t length = strlen(text);
+    size_t replacement_size = strlen(replacement);
+    *count = 0;
+    if (!length) return 1;
+    for (size_t i = 0; i < buf->text_size;) {
+        if (matches_text(buf, text, i)) {
+            (*count)++;
+            i += length;
+        } else i++;
+    }
+    if (!*count || strcmp(text, replacement) == 0) return 1;
+    size_t new_size = buf->text_size - *count * length;
+    if (replacement_size && *count > (SIZE_MAX - new_size) / replacement_size) return 0;
+    new_size += *count * replacement_size;
+    char* result = (char*)malloc(new_size ? new_size : 1);
+    if (!result) return 0;
+    size_t output = 0;
+    size_t cursor_after = 0;
+    int first_match = 1;
+    for (size_t i = 0; i < buf->text_size;) {
+        if (matches_text(buf, text, i)) {
+            if (replacement_size) memcpy(result + output, replacement, replacement_size);
+            if (first_match) {
+                cursor_after = output;
+                first_match = 0;
             }
+            output += replacement_size;
+            i += length;
+        } else result[output++] = buffer_character(buf, i++);
+    }
+    int success = record_edit(editor->history, buf, 0, buf->text_size, result, new_size,
+                              &editor->cursor_pos, cursor_after);
+    free(result);
+    return success;
+}
 
-            if (X_POS >= width - 1) {
-                X_POS = 1;
-                Y_POS++;
-                
-                display_line_number(Y_POS, Y_POS);
-                
-                if (Y_POS >= height) {
-                    break;
+int insert_newline(Editor* editor) {
+    size_t start = line_start(editor->buf, editor->cursor_pos);
+    size_t indent = 0;
+    if (editor->auto_indent) {
+        while (start + indent < editor->cursor_pos) {
+            char ch = buffer_character(editor->buf, start + indent);
+            if (ch != ' ' && ch != '\t') break;
+            indent++;
+        }
+    }
+    char* text = (char*)malloc(indent + 1);
+    if (!text) return 0;
+    text[0] = '\n';
+    for (size_t i = 0; i < indent; i++) text[i + 1] = buffer_character(editor->buf, start + i);
+    int success = record_edit(editor->history, editor->buf, editor->cursor_pos, 0, text, indent + 1,
+                              &editor->cursor_pos, editor->cursor_pos + indent + 1);
+    free(text);
+    return success;
+}
+
+static size_t display_column(const Buffer* buf, size_t start, size_t end) {
+    size_t column = 0;
+    for (size_t i = start; i < end; i++) {
+        column += buffer_character(buf, i) == '\t' ? TAB_WIDTH - column % TAB_WIDTH : 1;
+    }
+    return column;
+}
+
+void move_vertical(Editor* editor, int direction, size_t count) {
+    Buffer* buf = editor->buf;
+    size_t start = line_start(buf, editor->cursor_pos);
+    size_t column = display_column(buf, start, editor->cursor_pos);
+    while (count--) {
+        if (direction < 0) {
+            if (!start) break;
+            start = line_start(buf, start - 1);
+        } else {
+            size_t end = line_end(buf, start);
+            if (end == buf->text_size) break;
+            start = end + 1;
+        }
+    }
+    size_t position = start;
+    size_t current_column = 0;
+    while (position < buf->text_size && buffer_character(buf, position) != '\n') {
+        size_t width = buffer_character(buf, position) == '\t' ? TAB_WIDTH - current_column % TAB_WIDTH : 1;
+        if (current_column + width > column) break;
+        current_column += width;
+        position++;
+    }
+    editor->cursor_pos = position;
+}
+
+void redraw_window(Editor* editor) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    erase();
+    if (rows < 4 || cols < 16) {
+        addnstr("Resize terminal", cols > 0 ? cols - 1 : 0);
+        refresh();
+        return;
+    }
+    Buffer* buf = editor->buf;
+    size_t cursor_line = 0;
+    size_t lines = 1;
+    size_t words = 0;
+    int in_word = 0;
+    for (size_t i = 0; i < buf->text_size; i++) {
+        unsigned char ch = (unsigned char)buffer_character(buf, i);
+        if (ch == '\n') {
+            lines++;
+            if (i < editor->cursor_pos) cursor_line++;
+        }
+        if (isspace(ch)) in_word = 0;
+        else if (!in_word) {
+            words++;
+            in_word = 1;
+        }
+    }
+    size_t height = (size_t)(rows - 2);
+    size_t width = (size_t)(cols - LINE_NUMBER_WIDTH);
+    size_t column = display_column(buf, line_start(buf, editor->cursor_pos), editor->cursor_pos);
+    if (cursor_line < editor->top_line) editor->top_line = cursor_line;
+    if (cursor_line >= editor->top_line + height) editor->top_line = cursor_line - height + 1;
+    if (column < editor->left_column) editor->left_column = column;
+    if (column >= editor->left_column + width) editor->left_column = column - width + 1;
+    size_t position = line_position(buf, editor->top_line + 1);
+    size_t search_length = strlen(editor->search);
+    Language language = editor->syntax_mode ? (Language)(editor->syntax_mode - 1) : detect_language(editor->filename);
+    SyntaxToken token = {0, 0, SYNTAX_NORMAL};
+    SyntaxScanner scanner = {0};
+    scanner.buf = buf;
+    scanner.language = language;
+    for (size_t row = 0; row < height && editor->top_line + row < lines; row++) {
+        attron(A_DIM);
+        mvprintw((int)row, 0, "%5zu", (editor->top_line + row + 1) % 100000);
+        attroff(A_DIM);
+        size_t current_column = 0;
+        size_t highlighted_until = 0;
+        while (position < buf->text_size && buffer_character(buf, position) != '\n') {
+            unsigned char ch = (unsigned char)buffer_character(buf, position);
+            size_t cells = ch == '\t' ? TAB_WIDTH - current_column % TAB_WIDTH : 1;
+            if (search_length && matches_text(buf, editor->search, position)) highlighted_until = position + search_length;
+            while (token.end <= position) token = next_highlight_token(&scanner);
+            int attributes = syntax_attributes(token.type);
+            if (position < highlighted_until) attributes |= A_REVERSE;
+            attron(attributes);
+            for (size_t i = 0; i < cells; i++) {
+                size_t screen_column = current_column + i;
+                if (screen_column >= editor->left_column && screen_column - editor->left_column < width) {
+                    mvaddch((int)row, (int)(LINE_NUMBER_WIDTH + screen_column - editor->left_column),
+                            ch == '\t' ? ' ' : (ch >= 32 && ch <= 126 ? ch : '?'));
                 }
             }
-            
-            mvaddch(Y_POS, X_POS + LINE_NUMBER_WIDTH, buf->buffer[index]);
-            X_POS++;
+            attroff(attributes);
+            current_column += cells;
+            position++;
         }
+        if (position < buf->text_size) position++;
     }
-
-    coordinates.initial_x_pos = X_POS;
-    coordinates.initial_y_pos = Y_POS;
-    coordinates.status = 0;
-
-    refresh();
-    
-    return coordinates;
-}
-
-void redraw_window(Buffer* buf, size_t width) {
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    
-    size_t edit_area_height = (size_t)(rows - 2);
-    
-    clear();
-    size_t Y_POS = 0;
-    size_t X_POS = 1;
-    size_t displayed_chars = 0;
-    
-    display_line_number(Y_POS, Y_POS);
-    
-    for (size_t i = buf->first_character; i < buf->gap_start; i++) {
-        if (X_POS >= width - 1) {
-            X_POS = 1;
-            Y_POS++;
-            
-            if (Y_POS >= edit_area_height) {
-                break;
-            }
-            
-            display_line_number(Y_POS, Y_POS);
-        }
-        
-        int color = COLOR_PAIR(1);
-        
-        attron(color);
-        mvaddch(Y_POS, X_POS + LINE_NUMBER_WIDTH, buf->buffer[i]);
-        attroff(color);
-        X_POS++;
-        displayed_chars++;
-    }
-
-    size_t chars_after_gap = buf->text_size - buf->gap_start;
-    for (size_t i = 0; i < chars_after_gap; i++) {
-        if (X_POS >= width - 1) {
-            X_POS = 1;
-            Y_POS++;
-            
-            if (Y_POS >= edit_area_height) {
-                break;
-            }
-            
-            display_line_number(Y_POS, Y_POS);
-        }
-
-        size_t buffer_idx = buf->gap_end + i;
-        if (buffer_idx >= buf->buffer_size) {
-            break;
-        }
-        
-        int color = COLOR_PAIR(1);
-        
-        attron(color);
-        mvaddch(Y_POS, X_POS + LINE_NUMBER_WIDTH, buf->buffer[buffer_idx]);
-        attroff(color);
-        X_POS++;
-        displayed_chars++;
-    }
-
-    if (Y_POS < (size_t)(rows - 3)) {
-        buf->last_character = buf->first_character + displayed_chars;
-    }
-
-    refresh();
-}
-
-void render_backspace_on_window(Buffer* buf, size_t x_pos, size_t y_pos, size_t width) {
-    if (x_pos <= 1 && y_pos <= 0 && buf->first_character == 0) {
-        return;
-    }
-    
-    size_t screen_index = (x_pos - 1) + y_pos * (width - 2);
-    size_t buffer_index = screen_index + buf->first_character;
-    
-    if (buffer_index == 0) {
-        return;
-    }
-    
-    if (x_pos == 1 && y_pos > 0) {
-        y_pos--;
-        x_pos = width - 1;
-        
-        screen_index = (x_pos - 1) + y_pos * (width - 2);
-        buffer_index = screen_index + buf->first_character;
-    }
-    
-    move_buffer_cursor(buf, buffer_index);
-    delete_buffer(buf);
-    
-    redraw_window(buf, width);
-    
-    if (x_pos > 1) {
-        x_pos--;
-    } else if (y_pos > 0) {
-        y_pos--;
-        x_pos = width - 1;
-    }
-    
-    move(y_pos, x_pos + LINE_NUMBER_WIDTH);
-    refresh();
-}
-
-void render_space_on_window(Buffer* buf, size_t *x_pos, size_t *y_pos, size_t width) {
-    size_t screen_index = (*x_pos - 1 - LINE_NUMBER_WIDTH) + *y_pos * (width - 2);
-    size_t buffer_index = screen_index + buf->first_character;
-    
-    if (buffer_index <= buf->text_size) {
-        move_buffer_cursor(buf, buffer_index);
-    } else {
-        move_buffer_cursor(buf, buf->text_size);
-        while (buf->text_size < buffer_index) {
-            insert_buffer(buf, ' ');
-        }
-    }
-    
-    insert_buffer(buf, ' ');
-
-    redraw_window(buf, width);
-
-    (*x_pos)++;
-    if (*x_pos >= width - 1 + LINE_NUMBER_WIDTH) {
-        *x_pos = 1 + LINE_NUMBER_WIDTH;
-        (*y_pos)++;
-    }
-    move(*y_pos, *x_pos);
-    refresh();
-}
-
-void render_enter_on_window(Buffer* buf, size_t *x_pos, size_t *y_pos, size_t width) {
-    size_t screen_index = (*x_pos - 1 - LINE_NUMBER_WIDTH) + *y_pos * (width - 2);
-    size_t curr_index = screen_index + buf->first_character;
-    
-    if (curr_index > buf->text_size) {
-        curr_index = buf->text_size;
-    }
-    
-    move_buffer_cursor(buf, curr_index);
-    
-    size_t content_after_size = buf->text_size - curr_index;
-    char* content_after = NULL;
-    
-    if (content_after_size > 0) {
-        content_after = malloc(content_after_size + 1);
-        if (!content_after) {
-            perror("Failed to allocate memory");
-            return;
-        }
-        
-        size_t idx = 0;
-        for (size_t i = curr_index; i < buf->text_size; i++) {
-            char ch;
-            if (i < buf->gap_start) {
-                ch = buf->buffer[i];
-            } else {
-                size_t adjusted_pos = buf->gap_end + (i - buf->gap_start);
-                ch = buf->buffer[adjusted_pos];
-            }
-            content_after[idx++] = ch;
-        }
-        content_after[idx] = '\0';
-        
-        for (size_t i = 0; i < content_after_size; i++) {
-            move_buffer_cursor(buf, buf->text_size - 1);
-            delete_buffer(buf);
-        }
-    }
-    
-    size_t remain_on_line = (width - 2) - ((*x_pos - 1 - LINE_NUMBER_WIDTH));
-    for (size_t i = 0; i < remain_on_line; i++) {
-        insert_buffer(buf, ' ');
-    }
-    
-    (*y_pos)++;
-    *x_pos = 1 + LINE_NUMBER_WIDTH;
-    
-    display_line_number(*y_pos, *y_pos);
-    
-    if (content_after) {
-        for (size_t i = 0; i < content_after_size; i++) {
-            insert_buffer(buf, content_after[i]);
-        }
-        free(content_after);
-    }
-    
-    redraw_window(buf, width);
-    move(*y_pos, *x_pos);
-    refresh();
-}
-
-void update_general_window(Buffer* buf, size_t* x_pos, size_t* y_pos, int ch, size_t width) {
-    size_t screen_index = (*x_pos - 1 - LINE_NUMBER_WIDTH) + *y_pos * (width - 2);
-    size_t buffer_index = screen_index + buf->first_character;
-
-    if (*x_pos >= width - 1 + LINE_NUMBER_WIDTH) {
-        *x_pos = 1 + LINE_NUMBER_WIDTH;
-        (*y_pos)++;
-    }
-    
-    if (buffer_index <= buf->text_size) {
-        move_buffer_cursor(buf, buffer_index);
-    } else {
-        move_buffer_cursor(buf, buf->text_size);
-        while (buf->text_size < buffer_index) {
-            insert_buffer(buf, ' ');
-        }
-    }
-    
-    insert_buffer(buf, ch);
-    
-    redraw_window(buf, width);
-    
-    (*x_pos)++;
-    if (*x_pos >= width - 1 + LINE_NUMBER_WIDTH) {
-        *x_pos = 1 + LINE_NUMBER_WIDTH;
-        (*y_pos)++;
-    }
-    move(*y_pos, *x_pos);
-    refresh();
-}
-
-void render_delete_on_window(Buffer* buf, size_t x_pos, size_t y_pos, size_t width) {
-    size_t screen_index = (x_pos - 1 - LINE_NUMBER_WIDTH) + y_pos * (width - 2);
-    size_t buffer_index = screen_index + buf->first_character;
-    
-    if (buffer_index >= buf->text_size) {
-        return;
-    }
-    
-    move_buffer_cursor(buf, buffer_index + 1);
-    delete_buffer(buf);
-    
-    redraw_window(buf, width);
-    
-    move(y_pos, x_pos);
-    refresh();
-}
-
-size_t count_lines(Buffer* buf) {
-    if (!buf || buf->text_size == 0) return 0;
-    
-    size_t line_count = 1;
-    
-    for (size_t i = 0; i < buf->gap_start; i++) {
-        if (buf->buffer[i] == '\n') {
-            line_count++;
-        }
-    }
-    
-    for (size_t i = buf->gap_end; i < buf->buffer_size && buf->buffer[i] != '\0'; i++) {
-        if (buf->buffer[i] == '\n') {
-            line_count++;
-        }
-    }
-    
-    return line_count;
-}
-
-size_t count_words(Buffer* buf) {
-    if (!buf || buf->text_size == 0) return 0;
-    
-    size_t word_count = 0;
-    int in_word = 0;
-    
-    for (size_t i = 0; i < buf->gap_start; i++) {
-        char c = buf->buffer[i];
-        if (isspace(c) || c == '\n') {
-            in_word = 0;
-        } else if (!in_word) {
-            in_word = 1;
-            word_count++;
-        }
-    }
-    
-    in_word = 0;
-    
-    for (size_t i = buf->gap_end; i < buf->buffer_size && buf->buffer[i] != '\0'; i++) {
-        char c = buf->buffer[i];
-        if (isspace(c) || c == '\n') {
-            in_word = 0;
-        } else if (!in_word) {
-            in_word = 1;
-            word_count++;
-        }
-    }
-    
-    return word_count;
-}
-
-size_t count_non_space_chars(Buffer* buf) {
-    if (!buf || buf->text_size == 0) return 0;
-    
-    size_t char_count = 0;
-    
-    for (size_t i = 0; i < buf->gap_start; i++) {
-        if (buf->buffer[i] != ' ' && buf->buffer[i] != '\n' && buf->buffer[i] != '\t') {
-            char_count++;
-        }
-    }
-    
-    for (size_t i = buf->gap_end; i < buf->buffer_size && buf->buffer[i] != '\0'; i++) {
-        if (buf->buffer[i] != ' ' && buf->buffer[i] != '\n' && buf->buffer[i] != '\t') {
-            char_count++;
-        }
-    }
-    
-    return char_count;
-}
-
-void display_status_bar(Buffer* buf, const char* filename, size_t x_pos, size_t y_pos) {
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    
-    int cur_y, cur_x;
-    getyx(stdscr, cur_y, cur_x);
-    
-    size_t line_count = count_lines(buf);
-    size_t char_count = count_non_space_chars(buf);
-    size_t word_count = count_words(buf);
-    
-    const char* short_filename = filename;
-    const char* last_slash = strrchr(filename, '/');
-    if (last_slash) {
-        short_filename = last_slash + 1;
-    }
-    
-    char status_left[64];
-    char status_right[192];
-    
-    snprintf(status_left, sizeof(status_left), " %s ", 
-             short_filename ? short_filename : "Untitled");
-             
-    snprintf(status_right, sizeof(status_right), " UTF-8 | L: %zu | Ch: %zu | W: %zu | %zu:%zu ", 
-             line_count, 
-             char_count, 
-             word_count,
-             y_pos + 1, 
-             x_pos - LINE_NUMBER_WIDTH + 1);
-    
-    move(rows - 2, 0);
-    
-    size_t right_text_len = strlen(status_right);
-    size_t left_text_len = strlen(status_left);
-    int right_start = cols - right_text_len;
-    
-    if (right_start < (int)left_text_len) {
-        right_start = left_text_len;
-    }
-    
-    for (int i = 0; i < cols; i++) {
-        mvaddch(rows - 2, i, ' ');
-    }
-    
-    static int colors_initialized = 0;
-    if (!colors_initialized) {
-        start_color();
-        init_pair(20, COLOR_BLACK, COLOR_WHITE);
-        init_pair(21, COLOR_BLACK, COLOR_WHITE);
-        colors_initialized = 1;
-    }
-    
+    char status[1024];
+    const char* filename = strrchr(editor->filename, '/');
+    filename = filename ? filename + 1 : editor->filename;
+    snprintf(status, sizeof(status), " %s%s | %zu:%zu | %zu lines | %zu words | %s | indent %s",
+             filename, editor->history->revision != editor->history->saved_revision ? " [+]" : "",
+             cursor_line + 1, column + 1, lines, words, language_name(language), editor->auto_indent ? "on" : "off");
     attron(A_REVERSE);
-    mvprintw(rows - 2, 0, "%s", status_left);
-    
-    for (int i = left_text_len; i < right_start; i++) {
-        mvaddch(rows - 2, i, ' ');
-    }
-    
-    mvprintw(rows - 2, right_start, "%s", status_right);
+    mvhline(rows - 2, 0, ' ', cols);
+    mvaddnstr(rows - 2, 0, status, cols - 1);
     attroff(A_REVERSE);
-    
-    move(cur_y, cur_x);
+    mvaddnstr(rows - 1, 0, editor->message[0] ? editor->message : "^S Save  ^F Find  ^R Replace  ^G Line  ^Q Quit  F1 Help", cols - 1);
+    move((int)(cursor_line - editor->top_line), (int)(LINE_NUMBER_WIDTH + column - editor->left_column));
     refresh();
+}
+
+int prompt_input(Editor* editor, const char* label, char* input, size_t capacity) {
+    size_t length = strlen(input);
+    for (;;) {
+        redraw_window(editor);
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        move(rows - 1, 0);
+        clrtoeol();
+        int label_size = (int)strlen(label);
+        if (label_size > cols / 2) label_size = cols / 2;
+        addnstr(label, label_size);
+        size_t available = (size_t)(cols - label_size - 1);
+        size_t offset = length > available ? length - available : 0;
+        addnstr(input + offset, (int)available);
+        refresh();
+        int ch = getch();
+        if (ch == 27) return 0;
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) return 1;
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (length) input[--length] = '\0';
+        } else if (ch == 21) {
+            length = 0;
+            input[0] = '\0';
+        } else if (ch >= 32 && ch <= 126 && length + 1 < capacity) {
+            input[length++] = (char)ch;
+            input[length] = '\0';
+        }
+    }
+}
+
+void display_help(Editor* editor) {
+    const char* lines[] = {
+        "Textura shortcuts",
+        "Ctrl+S       Save",
+        "Ctrl+Q       Quit (confirm when modified)",
+        "Ctrl+Z / Y   Undo / redo",
+        "Ctrl+F       Find literal text (case sensitive)",
+        "Ctrl+N / P   Next / previous match, wrapping",
+        "Ctrl+R       Replace all, undone in one step",
+        "Ctrl+G       Go to line",
+        "Ctrl+A / E   Start / end of line (also Home / End)",
+        "Page Up/Down Move one screen",
+        "Enter        Newline with current indentation",
+        "Tab          Insert a tab (4-column display)",
+        "F2           Toggle automatic indentation",
+        "F3           Cycle language: Auto, Text, C, C++, Java, Python",
+        "F4           Switch dark / light syntax palette",
+        "Esc          Clear search highlights / cancel prompt",
+        "Ctrl+U       Clear prompt input",
+        "F1           Show this help",
+        "Press any key to return"
+    };
+    for (;;) {
+        erase();
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        size_t count = sizeof(lines) / sizeof(lines[0]);
+        for (size_t i = 0; i < count && i < (size_t)(rows - 1); i++) {
+            mvaddnstr((int)i, 0, lines[i], cols - 1);
+        }
+        mvaddnstr(rows - 1, 0, "Press any key to return", cols - 1);
+        refresh();
+        if (getch() != KEY_RESIZE) break;
+    }
+    redraw_window(editor);
 }
